@@ -1,3 +1,7 @@
+# OS files
+.DS_Store
+Thumbs.db
+
 # AWS / Credentials
 .env
 *.pem
