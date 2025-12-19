@@ -7,8 +7,8 @@ When using Databricks Unity Catalog (UC) Federation with an AWS Glue Iceberg cat
 
 `[DELTA_CLONE_INCOMPATIBLE_SOURCE.ICEBERG_UNDERGONE_PARTITION_EVOLUTION] The clone source has valid format, but has unsupported feature with Delta. Source iceberg table has undergone partition evolution.`
 
-### Why Engineering's Advice Fails
-The standard advice is to run `CALL system.rewrite_data_files(...)`. While this physically unifies the data, it does not clean the metadata history. Databricks performs a fail-fast check on the Iceberg `metadata.json` file. If the `partition-specs` array contains more than one entry (even if unused), Databricks blocks the query. For customers with 100+ trillion rows, a full CTAS/migration is not an option.
+### Why the Metadata Layer Needs Extra Care
+The standard practice of running `CALL system.rewrite_data_files(...)` is a great first step because it physically unifies the data. However, the metadata history still remembers the evolution. Databricks performs a fail-fast check on the Iceberg `metadata.json` file, and if the `partition-specs` array contains more than one entry, it blocks the query to be safe. For customers with 100+ trillion rows, this extra metadata cleanup is the final piece of the puzzle to avoid a massive CTAS/migration.
 
 ### Physical vs Logical Unification
 
