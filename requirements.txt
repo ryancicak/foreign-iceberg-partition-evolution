@@ -1,0 +1,7 @@
+# Iceberg Metadata Surgeon - Dependencies
+# Install with: pip install -r requirements.txt
+
+boto3>=1.34.0
+databricks-sdk>=0.20.0
+requests>=2.31.0
+
