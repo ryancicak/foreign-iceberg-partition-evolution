@@ -1,6 +1,10 @@
-# Iceberg Metadata Surgeon 🔪
+# Foreign Iceberg Partition Evolution Fix 🧊
 
-Bypassing the `ICEBERG_UNDERGONE_PARTITION_EVOLUTION` error in Databricks UC Federation without moving a single byte of data.
+Workarounds for the `ICEBERG_UNDERGONE_PARTITION_EVOLUTION` error in Databricks Unity Catalog Federation.
+
+**Two solutions included:**
+- ✅ **Compaction + Flag** (recommended) - preserves time travel
+- 🔪 **Metadata Surgery** - removes time travel but works without Spark flag
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -114,11 +118,56 @@ This will:
 
 ---
 
-## The Solution: Two-Step Workaround
+## Solutions
 
-### Step 1: Physical Data Unification (on EMR/Spark)
+### ✅ Solution 1: Compaction + Spark Flag (RECOMMENDED)
 
-Run this to rewrite all data files using the latest partition spec:
+**Preserves time travel. No metadata modification required.**
+
+This is the recommended approach for most use cases. It requires running compaction on the source system (EMR/Spark) and using a Spark configuration flag in Databricks.
+
+#### Step 1: Run compaction on the source table (EMR/Spark)
+
+```sql
+CALL system.rewrite_data_files(
+  table => 'your_database.your_table',
+  options => map('rewrite-all', 'true')
+);
+```
+
+This rewrites all data files to use the current partition spec.
+
+#### Step 2: Set the flag on a Databricks Classic Cluster
+
+Add this to your cluster's Spark configuration:
+
+```
+spark.databricks.delta.convert.iceberg.partitionEvolution.enabled true
+```
+
+#### Step 3: Query from that cluster first
+
+Run any query against the table to initialize the Delta layer. After that, Serverless Compute works too.
+
+#### Why both steps?
+
+| Approach | Result |
+|----------|--------|
+| Flag alone | ⚠️ May show NULLs for columns that became partition fields |
+| Compaction alone | ❌ Still blocked by the metadata check |
+| **Compaction + Flag** | ✅ **Correct data, partition filters work!** |
+
+> ⚠️ **Note:** This flag is not officially supported by Databricks engineering. However, for read-only foreign tables, the risk is minimal since you cannot write back to the source.
+
+---
+
+### Solution 2: Metadata Surgery (Removes Time Travel)
+
+**Use this only if time travel is not required.**
+
+If you don't need time travel to snapshots before the partition evolution, you can surgically remove the old partition specs from the metadata.
+
+#### Step 1: Physical Data Unification (on EMR/Spark)
 
 ```sql
 CALL system.rewrite_data_files(
@@ -128,7 +177,7 @@ CALL system.rewrite_data_files(
 CALL system.rewrite_manifests(table => 'database.table');
 ```
 
-### Step 2: Metadata Surgery
+#### Step 2: Metadata Surgery
 
 The `metadata_surgery.py` script:
 1. Downloads the latest Iceberg `metadata.json` from S3
@@ -139,6 +188,8 @@ The `metadata_surgery.py` script:
 ```bash
 python internal/metadata_surgery.py -d my_database -t my_table
 ```
+
+> ⚠️ **Warning:** This breaks time travel to any snapshot created before the partition evolution.
 
 ---
 
@@ -215,11 +266,24 @@ python internal/metadata_surgery.py --rollback rollback/DATABASE_TABLE_TIMESTAMP
 
 ## Risks & Safety
 
-### ⚠️ Time Travel Impact
-This surgery removes references to old partition layouts, effectively breaking time-travel to snapshots created before the evolution.
+### Solution 1 (Compaction + Flag) Risks
 
-### 🔄 Rollback
-The script automatically saves rollback information. To restore:
+| Risk | Mitigation |
+|------|------------|
+| Unsupported flag | For read-only foreign tables, you can't corrupt the source data |
+| Incorrect reads without compaction | Always run compaction before using the flag |
+| Need to re-run on new partition evolution | Query from classic cluster after each evolution to refresh |
+
+### Solution 2 (Metadata Surgery) Risks
+
+| Risk | Mitigation |
+|------|------------|
+| ⚠️ **Time Travel Broken** | Cannot query snapshots before the surgery |
+| Metadata corruption | Use `--dry-run` first; keep rollback files |
+
+### 🔄 Rollback (Solution 2 only)
+
+The surgery script automatically saves rollback information. To restore:
 
 ```bash
 python internal/metadata_surgery.py --rollback rollback/DATABASE_TABLE_TIMESTAMP.json
@@ -228,10 +292,12 @@ python internal/metadata_surgery.py --rollback rollback/DATABASE_TABLE_TIMESTAMP
 Or manually update the Glue table's `metadata_location` parameter to point to the original metadata file.
 
 ### 📋 Best Practices
-1. **Always run `rewrite_data_files` first** to ensure all data uses the latest spec
-2. **Use `--dry-run` first** to see what changes will be made
-3. **Test in non-production** before applying to critical tables
-4. **Keep rollback files** until you've verified the fix works
+
+1. **Try Solution 1 first** (Compaction + Flag) to preserve time travel
+2. **Always run `rewrite_data_files`** before either solution
+3. **Use `--dry-run`** before metadata surgery
+4. **Test in non-production** before applying to critical tables
+5. **Keep rollback files** until you've verified the fix works
 
 ---
 
