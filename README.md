@@ -1,330 +1,149 @@
-# Foreign Iceberg Partition Evolution Fix 🧊
+# Foreign Iceberg Table Fixes for Databricks
 
-Workarounds for the `ICEBERG_UNDERGONE_PARTITION_EVOLUTION` error in Databricks Unity Catalog Federation.
-
-**Two solutions included:**
-- ✅ **Compaction + Flag** (recommended) - preserves time travel
-- 🔪 **Metadata Surgery** - removes time travel but works without Spark flag
+Workarounds for common issues when reading foreign Iceberg tables in Databricks Unity Catalog Federation.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-## The Problem
-
-When using Databricks Unity Catalog (UC) Federation with an AWS Glue Iceberg catalog, any table that has undergone Partition Evolution (e.g., adding a new partition field) will fail to query with:
-
-```
-[DELTA_CLONE_INCOMPATIBLE_SOURCE.ICEBERG_UNDERGONE_PARTITION_EVOLUTION] 
-The clone source has valid format, but has unsupported feature with Delta. 
-Source iceberg table has undergone partition evolution.
-```
-
-### Why This Happens
-
-Databricks performs a fail-fast check on the Iceberg `metadata.json` file. If the `partition-specs` array contains more than one entry, it blocks the query - even if all current data files use the same partition spec.
-
-The standard fix of running `CALL system.rewrite_data_files(...)` **physically unifies the data** but **doesn't clean the metadata history**. The old partition spec remains as a "ghost" in the JSON.
-
-### Physical vs Logical Unification
-
-```
-INITIAL STATE (EVOLVED TABLE)
-────────────────────────────────────────────────────────────────────────────────
-METADATA LAYER (.metadata.json)             PHYSICAL LAYER (S3 Parquet Files)
-───────────────────────────────             ─────────────────────────────────
-[partition-specs]                           [data/ folder]
-│                                           │
-├── Spec ID 0: (category)                   ├── file_A.parquet (Linked to ID 0)
-└── Spec ID 1: (category, product)          └── file_B.parquet (Linked to ID 1)
-                                            
-Result: Databricks sees 2 specs → ERROR
-
-
-AFTER: CALL system.rewrite_data_files(...)
-────────────────────────────────────────────────────────────────────────────────
-METADATA LAYER (.metadata.json)             PHYSICAL LAYER (S3 Parquet Files)
-───────────────────────────────             ─────────────────────────────────
-[partition-specs]                           [data/ folder]
-│                                           │
-├── Spec ID 0: (category) ← GHOST           ├── file_A_NEW.parquet (ID 1)
-└── Spec ID 1: (category, product)          └── file_B.parquet (ID 1)
-
-Result: Physical files unified, but metadata still has 2 specs → STILL ERROR
-
-
-AFTER: METADATA SURGERY
-────────────────────────────────────────────────────────────────────────────────
-METADATA LAYER (.metadata.json)             PHYSICAL LAYER (S3 Parquet Files)
-───────────────────────────────             ─────────────────────────────────
-[partition-specs]                           [data/ folder]
-│                                           │
-└── Spec ID 1: (category, product)          ├── file_A_NEW.parquet (ID 1)
-                                            └── file_B.parquet (ID 1)
-
-Result: Only 1 spec in metadata → SUCCESS! ✅
-```
-
 ---
 
-## Quick Start
+## Issue 1: Partition Evolution
 
-### Prerequisites
+**Error:** `ICEBERG_UNDERGONE_PARTITION_EVOLUTION`
 
-- Python 3.8+
-- AWS CLI configured
-- Active EMR Cluster with Iceberg/Glue
-- Databricks workspace with Unity Catalog
-
-### Installation
-
-```bash
-git clone https://github.com/ryancicak/foreign-iceberg-partition-evolution.git
-cd foreign-iceberg-partition-evolution
-pip install -r requirements.txt
-```
-
-### Configuration
-
-Copy the example environment file and fill in your values:
-
-```bash
-cp env.example .env
-# Edit .env with your credentials
-```
-
-### Usage
-
-#### Option 1: Fix a Specific Table
-
-```bash
-# Analyze a table (dry-run)
-python internal/metadata_surgery.py --database my_db --table my_table --dry-run
-
-# Perform the surgery
-python internal/metadata_surgery.py --database my_db --table my_table
-```
-
-#### Option 2: Full Interactive Demo
-
-```bash
-chmod +x full_fix_automation.sh
-./full_fix_automation.sh
-```
-
-This will:
-1. Create a new Iceberg table with partition evolution
-2. Show the error in Databricks
-3. Run `rewrite_data_files` (show it doesn't fix the error)
-4. Run metadata surgery (show the fix works!)
-
----
-
-## Solutions
-
-### ✅ Solution 1: Compaction + Spark Flag (RECOMMENDED)
-
-**Preserves time travel. No metadata modification required.**
-
-This is the recommended approach for most use cases. It requires running compaction on the source system (EMR/Spark) and using a Spark configuration flag in Databricks.
-
-#### Step 1: Run compaction on the source table (EMR/Spark)
+### Fix: Compaction + Spark Flag
 
 ```sql
+-- On EMR/Spark
 CALL system.rewrite_data_files(
-  table => 'your_database.your_table',
+  table => 'your_db.your_table',
   options => map('rewrite-all', 'true')
 );
 ```
 
-This rewrites all data files to use the current partition spec.
-
-#### Step 2: Set the flag on a Databricks Classic Cluster
-
-Add this to your cluster's Spark configuration:
-
+Then add to Databricks Classic Cluster config:
 ```
 spark.databricks.delta.convert.iceberg.partitionEvolution.enabled true
 ```
 
-#### Step 3: Query from that cluster first
-
-Run any query against the table to initialize the Delta layer. After that, Serverless Compute works too.
-
-#### Why both steps?
-
-| Approach | Result |
-|----------|--------|
-| Flag alone | ⚠️ May show NULLs for columns that became partition fields |
-| Compaction alone | ❌ Still blocked by the metadata check |
-| **Compaction + Flag** | ✅ **Correct data, partition filters work!** |
-
-> ⚠️ **Note:** This flag is not officially supported by Databricks engineering. However, for read-only foreign tables, the risk is minimal since you cannot write back to the source.
+Query from that cluster first, then Serverless works too.
 
 ---
 
-### Solution 2: Metadata Surgery (Removes Time Travel)
+## Issue 2: V2 Merge-on-Read Delete Files
 
-**Use this only if time travel is not required.**
+**Error:** `requirement failed` at `DeleteFileWrapper`
 
-If you don't need time travel to snapshots before the partition evolution, you can surgically remove the old partition specs from the metadata.
+Databricks can't read V2 Iceberg tables with Merge-on-Read delete files.
 
-#### Step 1: Physical Data Unification (on EMR/Spark)
+### Fix: Upgrade to V3 + Compact
+
+**CRITICAL: Must use EMR 7.12+ (Iceberg 1.10+)**
+
+| EMR Version | Iceberg | V3 Support |
+|-------------|---------|------------|
+| < 7.12 | < 1.10 | [BROKEN] Missing `next-row-id` |
+| **7.12+** | **1.10+** | [OK] Full V3 support |
 
 ```sql
-CALL system.rewrite_data_files(
-  table => 'database.table', 
-  options => map('rewrite-all', 'true')
+-- Step 1: Upgrade to V3 (EMR 7.12+ ONLY!)
+ALTER TABLE glue_catalog.your_db.your_table 
+SET TBLPROPERTIES ('format-version' = '3');
+
+-- Step 2: Compact with delete file removal
+CALL glue_catalog.system.rewrite_data_files(
+  table => 'your_db.your_table',
+  options => map('rewrite-all', 'true', 'delete-file-threshold', '1')
 );
-CALL system.rewrite_manifests(table => 'database.table');
+
+-- Step 3: Expire old snapshots
+CALL glue_catalog.system.expire_snapshots(
+  table => 'your_db.your_table',
+  older_than => TIMESTAMP '2030-01-01 00:00:00',
+  retain_last => 1
+);
 ```
 
-#### Step 2: Metadata Surgery
+### Warning: V3 Upgrade on Old EMR Breaks Tables!
 
-The `metadata_surgery.py` script:
-1. Downloads the latest Iceberg `metadata.json` from S3
-2. Removes all old partition specs from the `partition-specs` array
-3. Uploads a new sanitized metadata file
-4. Updates the Glue Catalog to point to the new metadata
-
-```bash
-python internal/metadata_surgery.py -d my_database -t my_table
-```
-
-> ⚠️ **Warning:** This breaks time travel to any snapshot created before the partition evolution.
+If you upgrade to V3 on EMR < 7.12:
+- Table becomes **unreadable** by both Databricks AND EMR 7.12+
+- Missing `next-row-id` field in metadata
+- **Fix requires metadata surgery** (see below)
 
 ---
 
-## Project Structure
+## Issue 3: V3 Table Missing `next-row-id`
 
+**Error:** `Cannot parse missing long: next-row-id`
+
+This happens when V3 upgrade was done on EMR < 7.12.
+
+### Fix: Metadata Surgery
+
+```bash
+# Download metadata
+aws s3 cp s3://bucket/warehouse/db.db/table/metadata/LATEST.metadata.json /tmp/meta.json
+
+# Add next-row-id (Python)
+python3 << 'EOF'
+import json
+with open('/tmp/meta.json', 'r') as f:
+    data = json.load(f)
+data['next-row-id'] = 0
+with open('/tmp/fixed.json', 'w') as f:
+    json.dump(data, f)
+EOF
+
+# Upload fixed metadata
+NEW_FILE="00999-$(uuidgen).metadata.json"
+aws s3 cp /tmp/fixed.json "s3://bucket/warehouse/db.db/table/metadata/$NEW_FILE"
+
+# Update Glue catalog
+aws glue update-table --database-name your_db --table-input '{
+  "Name": "your_table",
+  "Parameters": {
+    "table_type": "ICEBERG",
+    "metadata_location": "s3://bucket/warehouse/db.db/table/metadata/'"$NEW_FILE"'"
+  }
+}'
 ```
-foreign-iceberg-partition-evolution/
-├── full_fix_automation.sh      # Main automation script
-├── requirements.txt            # Python dependencies
-├── env.example                 # Environment template
-├── README.md
-├── LICENSE
-└── internal/
-    ├── config.py               # Shared configuration loader
-    ├── metadata_surgery.py     # Core surgery script
-    ├── databricks_uc_setup.py  # Databricks UC federation setup
-    ├── lake_formation_setup.py # AWS Lake Formation permissions
-    └── ...
-```
+
+Then run compaction on EMR 7.12+ (see Issue 2).
 
 ---
 
-## Command Reference
+## Quick Reference
 
-### Metadata Surgery
-
-```bash
-# Analyze table without making changes
-python internal/metadata_surgery.py -d DATABASE -t TABLE --analyze
-
-# Dry run - show what would happen
-python internal/metadata_surgery.py -d DATABASE -t TABLE --dry-run
-
-# Perform surgery
-python internal/metadata_surgery.py -d DATABASE -t TABLE
-
-# Rollback to previous metadata
-python internal/metadata_surgery.py --rollback rollback/DATABASE_TABLE_TIMESTAMP.json
-```
-
-### Automation Script
-
-```bash
-# Interactive mode
-./full_fix_automation.sh
-
-# Targeted fix for specific table
-./full_fix_automation.sh --targeted database.table
-
-# Full demo mode
-./full_fix_automation.sh --demo
-
-# Show help
-./full_fix_automation.sh --help
-```
+| Problem | Solution |
+|---------|----------|
+| Partition evolution error | Compact + Spark flag |
+| V2 MoR delete files | Upgrade to V3 on EMR 7.12+ |
+| V3 missing `next-row-id` | Metadata surgery + compact |
 
 ---
 
 ## Environment Variables
 
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `AWS_ACCESS_KEY_ID` | AWS access key | Yes |
-| `AWS_SECRET_ACCESS_KEY` | AWS secret key | Yes |
-| `AWS_DEFAULT_REGION` | AWS region (e.g., us-west-2) | Yes |
-| `DATABRICKS_HOST` | Databricks workspace URL | Yes |
-| `DATABRICKS_TOKEN` | Databricks PAT | Yes |
-| `EMR_CLUSTER_ID` | EMR cluster ID (e.g., j-XXXXX) | For demo |
-| `EMR_PEM_PATH` | Path to EMR SSH key | For demo |
-| `GLUE_DATABASE` | Glue database name | For targeted fix |
-| `GLUE_TABLE` | Glue table name | For targeted fix |
-
----
-
-## Risks & Safety
-
-### Solution 1 (Compaction + Flag) Risks
-
-| Risk | Mitigation |
-|------|------------|
-| Unsupported flag | For read-only foreign tables, you can't corrupt the source data |
-| Incorrect reads without compaction | Always run compaction before using the flag |
-| Need to re-run on new partition evolution | Query from classic cluster after each evolution to refresh |
-
-### Solution 2 (Metadata Surgery) Risks
-
-| Risk | Mitigation |
-|------|------------|
-| ⚠️ **Time Travel Broken** | Cannot query snapshots before the surgery |
-| Metadata corruption | Use `--dry-run` first; keep rollback files |
-
-### 🔄 Rollback (Solution 2 only)
-
-The surgery script automatically saves rollback information. To restore:
-
 ```bash
-python internal/metadata_surgery.py --rollback rollback/DATABASE_TABLE_TIMESTAMP.json
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_DEFAULT_REGION="us-west-2"
+export DATABRICKS_HOST="https://xxx.cloud.databricks.com"
+export DATABRICKS_TOKEN="dapi..."
+export EMR_CLUSTER_ID="j-..."
+export EMR_PEM_PATH="/path/to/key.pem"
 ```
 
-Or manually update the Glue table's `metadata_location` parameter to point to the original metadata file.
-
-### 📋 Best Practices
-
-1. **Try Solution 1 first** (Compaction + Flag) to preserve time travel
-2. **Always run `rewrite_data_files`** before either solution
-3. **Use `--dry-run`** before metadata surgery
-4. **Test in non-production** before applying to critical tables
-5. **Keep rollback files** until you've verified the fix works
-
 ---
 
-## Troubleshooting
+## Scripts
 
-### Lake Formation Permissions
-If you see `AccessDeniedException` errors, you may need to:
-1. Add your IAM user/role as a Lake Formation admin
-2. Grant permissions on the database and table
-3. Use the `lake_formation_setup.py` helper
-
-### Glue Connection Issues
-Databricks Glue connections require **SERVICE** credentials, not storage credentials. Use `databricks_uc_setup.py` to create properly configured connections.
-
-### EMR SSH Issues
-Ensure:
-1. The PEM file has correct permissions (`chmod 600`)
-2. The EMR cluster security group allows SSH (port 22)
-3. The cluster is in WAITING or RUNNING state
-
----
-
-## Contributing
-
-This is an unofficial workaround developed for large-scale customers where data movement is physically or financially impossible.
-
-Issues and PRs welcome!
+| Script | Purpose |
+|--------|---------|
+| `full_fix_automation.sh` | Interactive demo of partition evolution fix |
+| `internal/metadata_surgery.py` | Remove old partition specs from metadata |
+| `internal/lake_formation_setup.py` | Grant Lake Formation permissions |
+| `internal/databricks_uc_setup.py` | Setup Databricks Glue connection |
 
 ---
 
@@ -334,4 +153,4 @@ Issues and PRs welcome!
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+MIT License - see [LICENSE](LICENSE)
